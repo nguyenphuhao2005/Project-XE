@@ -1,1 +1,916 @@
+// ============================================================
+//  ESP32 Car Controller v3.26 - Encoder Avoid (no cooldown)
+// ============================================================
+//  - Lùi 30cm, sau đó quét servo tìm hướng, quay 90°
+//  - Không giới hạn thời gian giữa các lần tránh
+//  - Giữ nguyên compass, turning/moving logic, APIs
 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HMC5883_U.h>
+#include <math.h>
+
+// ─── WIFI ───────────────────────────────────────────────────
+const char* SSID     = "iPhone";
+const char* PASSWORD = "hhhhhhhh";
+WebServer server(80);
+
+// ─── CHÂN MOTOR ─────────────────────────────────────────────
+#define IN1 32
+#define IN2 33
+#define IN3 26
+#define IN4 27
+#define ENA 25
+#define ENB 18
+#define ENC_L 14
+#define ENC_R 15
+
+volatile long rawCountL = 0;
+volatile long rawCountR = 0;
+
+// ─── CẢM BIẾN SIÊU ÂM ─────────────────────────────────────
+#define TRIG 5
+#define ECHO 34
+
+// ─── SERVO (LEDC) ────────────────────────────────────────
+#define SERVO_PIN 12
+const int SERVO_CHANNEL = 2;
+int currentServoAngle = 90;
+
+void setServoAngle(int angle);
+
+// ─── LA BÀN ─────────────────────────────────────────────────
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+bool compassOK = false;
+
+// ─── THÔNG SỐ XE ────────────────────────────────────────────
+const float WHEEL_D      = 3.5f;
+const int   PPR          = 20;
+const float WHEEL_BASE   = 11.0f;
+const float DECLINATION  = 0.01f;
+const float CM_PER_PULSE = (PI * WHEEL_D) / PPR;
+
+// ─── PWM ────────────────────────────────────────────────────
+const int PWM_FREQ     = 1000;
+const int PWM_RES      = 8;
+const int PWM_CH_LEFT  = 0;
+const int PWM_CH_RIGHT = 1;
+int moveSpeed = 150;
+int turnSpeed = 190;
+
+// ─── VỊ TRÍ ─────────────────────────────────────────────────
+float posX  = 0.0f;
+float posY  = 0.0f;
+float theta = 0.0f;
+float filteredTheta = 0.0f;
+bool  thetaInitialized = false;
+
+String motorDir = "stop";
+
+// ─── PATH ───────────────────────────────────────────────────
+#define MAX_PATH 200
+float pathX[MAX_PATH];
+float pathY[MAX_PATH];
+int   pathLen = 0;
+
+// ─── NAVIGATION ─────────────────────────────────────────────
+enum NavState { IDLE, TURNING, MOVING, ARRIVED, AVOIDING };
+NavState navState = IDLE;
+float targetX       = 0;
+float targetY       = 0;
+float targetHeading = 0;
+float targetDist    = 0;
+
+// ─── ODOMETRY TRACKING ──────────────────────────────────────
+long odomPrevL = 0;
+long odomPrevR = 0;
+long moveStartL = 0;
+long moveStartR = 0;
+
+// ─── TOLERANCES ─────────────────────────────────────────────
+const float ANGLE_TOL   = 10.0f * DEG_TO_RAD;
+const float DIST_TOL    = 3.5f;
+const float CORRECT_TOL = 35.0f * DEG_TO_RAD;
+
+// ─── TIMING ─────────────────────────────────────────────────
+unsigned long lastNavMs    = 0;
+const int     NAV_INTERVAL = 25;
+
+// ─── ARRIVED AUTO-RESET ─────────────────────────────────────
+unsigned long arrivedAtMs          = 0;
+const unsigned long RESET_DELAY_MS = 10000UL;
+bool pendingAutoReset = false;
+
+// ─── MANUAL CMD TIMEOUT ─────────────────────────────────────
+unsigned long lastManualCmdMs      = 0;
+const unsigned long CMD_TIMEOUT_MS = 400UL;
+bool motorIsRunning = false;
+unsigned long lastCorrectMs = 0;
+
+int moveDirection = 1;
+
+// ─── CHỐNG RUNG LẮC (TURNING) ───────────────────────────────
+int  persistentTurnDir = 0;
+bool slowingDown    = false;
+bool directionLocked = false;
+unsigned long lastPulseMs = 0;
+bool pulseActive = false;
+const unsigned long PULSE_ON_MS  = 80;
+const unsigned long PULSE_OFF_MS = 200;
+int pulseCount = 0;
+const int MAX_PULSES = 4;
+
+// ─── COMPASS CONFIG ─────────────────────────────────────────
+bool compassFlipX = false;
+bool compassFlipY = false;
+
+// ─── COMPASS FILTER ─────────────────────────────────────────
+#define COMPASS_SAMPLES 3
+float compassReadings[COMPASS_SAMPLES];
+int compassIndex = 0;
+
+// ─── OBSTACLE AVOIDANCE (encoder‑based, no cooldown) ───────
+bool obstacleAvoidEnabled = false;
+float obstacleDistance = 999.0;
+const float AVOID_THRESHOLD = 20.0;
+
+enum AvoidState { AV_FORWARD, AV_BACKWARD, AV_SCAN, AV_TURN };
+AvoidState avoidState = AV_FORWARD;
+long avoidStartL = 0, avoidStartR = 0;
+float avoidTargetDist = 30.0;               // lùi 30 cm
+float avoidTargetAngleRad = 90.0 * DEG_TO_RAD; // quay 90°
+bool avoidActionActive = false;
+
+bool obstacleConfirmed = false;
+unsigned long obstacleDetectedTime = 0;
+
+// Quét servo
+int avoidScanPhase = 0;            // 0: quay trái, 1: chờ trái, 2: quay phải, 3: chờ phải, 4: quyết định
+unsigned long avoidScanTimer = 0;
+float avoidDistLeft = 0;
+float avoidDistRight = 0;
+
+enum AvoidTurnDirection { AV_LEFT, AV_RIGHT };
+AvoidTurnDirection turnDirection = AV_LEFT;
+
+// ─── ISR ────────────────────────────────────────────────────
+void IRAM_ATTR isrEncL() { rawCountL++; }
+void IRAM_ATTR isrEncR() { rawCountR++; }
+
+void readEncoders(long &l, long &r) {
+  noInterrupts();
+  l = rawCountL;
+  r = rawCountR;
+  interrupts();
+}
+
+// ─── SIÊU ÂM ───────────────────────────────────────────────
+float measureDistance() {
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  long duration = pulseIn(ECHO, HIGH, 30000);
+  if (duration == 0) return 999.0;
+  return duration * 0.0343 / 2.0;
+}
+
+float measureDistanceAtAngle(int angle) {
+  if (angle != currentServoAngle) {
+    setServoAngle(angle);
+    delay(300);
+  }
+  return measureDistance();
+}
+
+// ─── SERVO (LEDC) ─────────────────────────────────────────
+void setServoAngle(int angle) {
+  angle = constrain(angle, 0, 180);
+  uint32_t duty = map(angle, 0, 180, 1638, 8191);
+  ledcWrite(SERVO_CHANNEL, duty);
+  currentServoAngle = angle;
+}
+
+// ─── COMPASS ────────────────────────────────────────────────
+float getCompassHeading() {
+  sensors_event_t ev;
+  mag.getEvent(&ev);
+  if (compassFlipX) ev.magnetic.x = -ev.magnetic.x;
+  if (compassFlipY) ev.magnetic.y = -ev.magnetic.y;
+  float h = atan2f(ev.magnetic.y, ev.magnetic.x) + DECLINATION;
+  while (h < 0) h += 2.0f * PI;
+  while (h > 2 * PI) h -= 2.0f * PI;
+  return h;
+}
+
+void updateCompassTheta() {
+  float raw = getCompassHeading();
+  if (!thetaInitialized) {
+    for (int i = 0; i < COMPASS_SAMPLES; i++) compassReadings[i] = raw;
+    filteredTheta = raw;
+    theta = raw;
+    thetaInitialized = true;
+    compassIndex = 0;
+  } else {
+    compassReadings[compassIndex] = raw;
+    compassIndex = (compassIndex + 1) % COMPASS_SAMPLES;
+    float sum = 0;
+    for (int i = 0; i < COMPASS_SAMPLES; i++) sum += compassReadings[i];
+    filteredTheta = sum / COMPASS_SAMPLES;
+    theta = filteredTheta;
+  }
+}
+
+// ─── MOTOR DRIVERS ──────────────────────────────────────────
+void motorStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  ledcWrite(PWM_CH_LEFT, 0); ledcWrite(PWM_CH_RIGHT, 0);
+  motorIsRunning = false;
+  motorDir = "stop";
+  pulseActive = false;
+}
+
+void motorForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(PWM_CH_LEFT, moveSpeed);
+  ledcWrite(PWM_CH_RIGHT, moveSpeed);
+  motorIsRunning = true;
+  moveDirection = 1;
+  motorDir = "forward";
+  pulseActive = false;
+}
+
+void motorBackward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWrite(PWM_CH_LEFT, moveSpeed);
+  ledcWrite(PWM_CH_RIGHT, moveSpeed);
+  motorIsRunning = true;
+  moveDirection = -1;
+  motorDir = "backward";
+  pulseActive = false;
+}
+
+void motorTurnLeftRaw(int spd) {
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  ledcWrite(PWM_CH_LEFT, spd); ledcWrite(PWM_CH_RIGHT, spd);
+}
+
+void motorTurnRightRaw(int spd) {
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  ledcWrite(PWM_CH_LEFT, spd); ledcWrite(PWM_CH_RIGHT, spd);
+}
+
+void motorTurnLeftSpeed(int spd) {
+  motorTurnLeftRaw(spd);
+  motorIsRunning = true;
+  motorDir = "left";
+}
+
+void motorTurnRightSpeed(int spd) {
+  motorTurnRightRaw(spd);
+  motorIsRunning = true;
+  motorDir = "right";
+}
+
+void motorTurnLeft() { motorTurnLeftSpeed(turnSpeed); }
+void motorTurnRight() { motorTurnRightSpeed(turnSpeed); }
+
+// ─── GÓC DELTA ──────────────────────────────────────────────
+float angleDiff(float target, float current) {
+  float d = target - current;
+  while (d > PI) d -= 2.0f * PI;
+  while (d < -PI) d += 2.0f * PI;
+  return d;
+}
+
+// ─── ODOMETRY ───────────────────────────────────────────────
+void resetPositionOnly() {
+  posX = 0; posY = 0; pathLen = 0;
+  noInterrupts();
+  rawCountL = 0; rawCountR = 0;
+  odomPrevL = 0; odomPrevR = 0;
+  moveStartL = 0; moveStartR = 0;
+  interrupts();
+}
+
+void beginMoving() {
+  resetPositionOnly();
+  if (compassOK) updateCompassTheta();
+  else { theta = targetHeading; filteredTheta = targetHeading; }
+  readEncoders(moveStartL, moveStartR);
+  odomPrevL = moveStartL; odomPrevR = moveStartR;
+  navState = MOVING;
+  lastCorrectMs = millis();
+  directionLocked = false;
+}
+
+void updateOdometry() {
+  if (!motorIsRunning) return;
+  long cL, cR;
+  readEncoders(cL, cR);
+  long dL = cL - odomPrevL;
+  long dR = cR - odomPrevR;
+  odomPrevL = cL; odomPrevR = cR;
+  if (dL == 0 && dR == 0) return;
+
+  float DL = dL * CM_PER_PULSE;
+  float DR = dR * CM_PER_PULSE;
+
+  if (navState == TURNING) {
+    if (!compassOK) {
+      float dTheta = (DR - DL) / WHEEL_BASE;
+      theta += dTheta;
+      filteredTheta = theta;
+      while (theta < 0) theta += 2.0f * PI;
+      while (theta > 2 * PI) theta -= 2.0f * PI;
+    }
+    return;
+  }
+
+  float D = (DL + DR) / 2.0f;
+  if (navState == MOVING || navState == IDLE || navState == ARRIVED)
+    D *= moveDirection;
+
+  if (!compassOK) {
+    float dTheta = (DR - DL) / WHEEL_BASE;
+    theta += dTheta;
+    filteredTheta = theta;
+    while (theta < 0) theta += 2.0f * PI;
+    while (theta > 2 * PI) theta -= 2.0f * PI;
+  }
+
+  posX += D * cosf(theta);
+  posY += D * sinf(theta);
+  if (fabsf(D) > 0.5f && pathLen < MAX_PATH) {
+    pathX[pathLen] = posX;
+    pathY[pathLen] = posY;
+    pathLen++;
+  }
+}
+
+// ─── NAVIGATION LOOP ────────────────────────────────────────
+void runNavigation() {
+  if (navState == IDLE || navState == ARRIVED) return;
+
+  if (compassOK) updateCompassTheta();
+  else if (navState != AVOIDING) updateOdometry();
+
+  // ════════════════════════════════════════════════════════
+  //  TRẠNG THÁI: TURNING
+  // ════════════════════════════════════════════════════════
+  if (navState == TURNING) {
+    float diff    = angleDiff(targetHeading, theta);
+    float absDiff = fabsf(diff);
+
+    if (absDiff <= ANGLE_TOL) {
+      motorStop();
+      pulseCount = 0;
+      delay(300);
+      if (compassOK) updateCompassTheta();
+      float diffAfterStop = angleDiff(targetHeading, theta);
+      if (fabsf(diffAfterStop) <= ANGLE_TOL * 1.5f) {
+        beginMoving();
+      } else {
+        persistentTurnDir = 0;
+        directionLocked   = false;
+      }
+      return;
+    }
+
+    if (persistentTurnDir == 0) {
+      persistentTurnDir = (diff > 0) ? 1 : -1;
+    } else if (!directionLocked) {
+      if (absDiff > 22.0f * DEG_TO_RAD) {
+        if (persistentTurnDir == 1 && diff < -ANGLE_TOL * 1.5f) {
+          persistentTurnDir = -1;
+          pulseCount = 0;
+        } else if (persistentTurnDir == -1 && diff > ANGLE_TOL * 1.5f) {
+          persistentTurnDir = 1;
+          pulseCount = 0;
+        }
+      }
+    }
+    directionLocked = (absDiff < 22.0f * DEG_TO_RAD);
+
+    if (absDiff < 22.0f * DEG_TO_RAD) {
+      if (pulseCount >= MAX_PULSES) {
+        motorStop();
+        pulseActive = false;
+        beginMoving();
+        directionLocked = false;
+        return;
+      }
+      unsigned long nowMs = millis();
+      if (!pulseActive) {
+        if (nowMs - lastPulseMs > PULSE_OFF_MS) {
+          int spd = max(45, (int)(turnSpeed * 0.25));
+          if (persistentTurnDir == 1) motorTurnLeftSpeed(spd);
+          else motorTurnRightSpeed(spd);
+          pulseActive = true;
+          lastPulseMs = nowMs;
+          pulseCount++;
+        }
+      } else {
+        if (nowMs - lastPulseMs > PULSE_ON_MS) {
+          motorStop();
+          pulseActive = false;
+          lastPulseMs = nowMs;
+        }
+      }
+      slowingDown = true;
+
+    } else if (absDiff < 45.0f * DEG_TO_RAD) {
+      int spd = max(60, (int)(turnSpeed * 0.6));
+      if (persistentTurnDir == 1) motorTurnLeftSpeed(spd);
+      else motorTurnRightSpeed(spd);
+      slowingDown = true;
+      pulseActive = false;
+      pulseCount  = 0;
+
+    } else {
+      if (persistentTurnDir == 1) motorTurnLeftSpeed(turnSpeed);
+      else motorTurnRightSpeed(turnSpeed);
+      slowingDown = false;
+      pulseActive = false;
+      pulseCount  = 0;
+    }
+  }
+
+  // ════════════════════════════════════════════════════════
+  //  TRẠNG THÁI: MOVING
+  // ════════════════════════════════════════════════════════
+  else if (navState == MOVING) {
+    long cL, cR;
+    readEncoders(cL, cR);
+
+    float distTraveled = ((cL - moveStartL) + (cR - moveStartR)) / 2.0f * CM_PER_PULSE;
+
+    float dx = targetX - posX;
+    float dy = targetY - posY;
+    float distRemain = sqrtf(dx * dx + dy * dy);
+
+    if (distRemain <= DIST_TOL || distTraveled >= targetDist) {
+      motorStop();
+      posX = targetX;
+      posY = targetY;
+      navState         = ARRIVED;
+      arrivedAtMs      = millis();
+      pendingAutoReset = true;
+      return;
+    }
+
+    if (compassOK) {
+      float headingToTarget = atan2f(dy, dx);
+      if (headingToTarget < 0) headingToTarget += 2.0f * PI;
+      float hdiff = angleDiff(headingToTarget, theta);
+      if (fabsf(hdiff) > CORRECT_TOL && distRemain > 15.0f && (millis() - lastCorrectMs > 2000)) {
+        motorStop();
+        delay(40);
+        targetHeading = headingToTarget;
+        lastCorrectMs = millis();
+        navState      = TURNING;
+        persistentTurnDir = 0;
+        directionLocked   = false;
+        pulseActive       = false;
+        pulseCount        = 0;
+        return;
+      }
+    }
+
+    motorForward();
+  }
+
+  // ════════════════════════════════════════════════════════
+  //  TRẠNG THÁI: AVOIDING (encoder‑based, không cooldown)
+  // ════════════════════════════════════════════════════════
+  else if (navState == AVOIDING) {
+    if (!obstacleAvoidEnabled) {
+      motorStop();
+      navState = IDLE;
+      return;
+    }
+
+    unsigned long now = millis();
+
+    switch (avoidState) {
+
+      // ── ĐI THẲNG, RÀ SIÊU ÂM ──────────────────────────
+      case AV_FORWARD:
+        motorForward();
+        if (currentServoAngle != 90) setServoAngle(90);
+
+        if (obstacleDistance < AVOID_THRESHOLD && obstacleDistance > 0) {
+          if (!obstacleConfirmed) {
+            obstacleDetectedTime = now;
+            obstacleConfirmed = true;
+          } else if (now - obstacleDetectedTime > 200) {
+            // Xác nhận vật cản → dừng, bắt đầu lùi 30 cm
+            motorStop();
+            obstacleConfirmed = false;
+            readEncoders(avoidStartL, avoidStartR);
+            avoidTargetDist = 30.0;        // lùi 30 cm
+            avoidActionActive = true;
+            avoidState = AV_BACKWARD;
+            motorBackward();
+          }
+        } else {
+          obstacleConfirmed = false;
+        }
+        break;
+
+      // ── LÙI 30 cm ────────────────────────────────────
+      case AV_BACKWARD:
+        if (avoidActionActive) {
+          long cL, cR;
+          readEncoders(cL, cR);
+          long dL = abs(cL - avoidStartL);
+          long dR = abs(cR - avoidStartR);
+          float avgDist = (dL + dR) / 2.0f * CM_PER_PULSE;
+          if (avgDist >= avoidTargetDist) {
+            motorStop();
+            avoidActionActive = false;
+            // Chuyển sang quét servo tìm hướng
+            avoidState = AV_SCAN;
+            avoidScanPhase = 0;
+            avoidScanTimer = now;
+          }
+        }
+        break;
+
+      // ── QUÉT SERVO TÌM HƯỚNG TRỐNG ──────────────────
+      case AV_SCAN:
+        switch (avoidScanPhase) {
+          case 0: // bắt đầu: quay servo sang trái (0°)
+            setServoAngle(0);
+            avoidScanTimer = now;
+            avoidScanPhase = 1;
+            break;
+
+          case 1: // chờ servo ổn định rồi đo trái
+            if (now - avoidScanTimer > 350) {
+              avoidDistLeft = measureDistance();
+              setServoAngle(180);          // quay sang phải
+              avoidScanTimer = now;
+              avoidScanPhase = 2;
+            }
+            break;
+
+          case 2: // chờ servo rồi đo phải
+            if (now - avoidScanTimer > 350) {
+              avoidDistRight = measureDistance();
+              avoidScanPhase = 3;          // chuyển sang bước quyết định
+            }
+            break;
+
+          case 3: // quyết định hướng và bắt đầu quay 90°
+            setServoAngle(90);             // trả servo về giữa
+
+            // Chọn hướng: ưu tiên bên có khoảng trống > AVOID_THRESHOLD
+            if (avoidDistLeft > avoidDistRight && avoidDistLeft > AVOID_THRESHOLD)
+              turnDirection = AV_LEFT;
+            else if (avoidDistRight > AVOID_THRESHOLD)
+              turnDirection = AV_RIGHT;
+            else
+              turnDirection = AV_LEFT;     // mặc định trái nếu cả hai đều kẹt
+
+            // Chuẩn bị quay
+            readEncoders(avoidStartL, avoidStartR);
+            avoidTargetAngleRad = 90.0 * DEG_TO_RAD;
+            avoidState = AV_TURN;
+            avoidActionActive = true;
+            if (turnDirection == AV_LEFT) motorTurnLeft();
+            else motorTurnRight();
+
+            avoidScanPhase = 0;            // reset cho lần sau
+            break;
+        }
+        break;
+
+      // ── QUAY 90° THEO HƯỚNG ĐÃ CHỌN ────────────────
+      case AV_TURN:
+        if (avoidActionActive) {
+          long cL, cR;
+          readEncoders(cL, cR);
+          long dL = abs(cL - avoidStartL);
+          long dR = abs(cR - avoidStartR);
+          float totalDist = (dL + dR) * CM_PER_PULSE;
+          float angleRad = totalDist / WHEEL_BASE;
+          if (angleRad >= avoidTargetAngleRad) {
+            motorStop();
+            avoidActionActive = false;
+            avoidState = AV_FORWARD;       // tiếp tục đi thẳng
+            obstacleConfirmed = false;      // sẵn sàng phát hiện vật cản mới
+            setServoAngle(90);
+          }
+        }
+        break;
+    }
+  }
+}
+
+// ─── API: /data ─────────────────────────────────────────────
+void handleData() {
+  if (compassOK) updateCompassTheta();
+
+  long resetCountdownMs = -1;
+  if (pendingAutoReset && navState == ARRIVED) {
+    resetCountdownMs = (long)RESET_DELAY_MS - (long)(millis() - arrivedAtMs);
+    if (resetCountdownMs < 0) resetCountdownMs = 0;
+  }
+
+  String modeStr;
+  if (navState == TURNING) modeStr = "turning";
+  else if (navState == MOVING) modeStr = "moving";
+  else if (navState == ARRIVED) modeStr = "arrived";
+  else if (navState == AVOIDING) modeStr = "avoiding";
+  else modeStr = "idle";
+
+  float turnAngleDeg = 0;
+  String turnDirStr = "none";
+  if (navState == TURNING) {
+    float diff = angleDiff(targetHeading, theta);
+    turnAngleDeg = fabsf(diff) * RAD_TO_DEG;
+    turnDirStr = (persistentTurnDir == 1) ? "left" : "right";
+  }
+
+  String pathJSON = "[";
+  for (int i = 0; i < pathLen; i++) {
+    if (i) pathJSON += ",";
+    pathJSON += "[" + String(pathX[i], 1) + "," + String(pathY[i], 1) + "]";
+  }
+  pathJSON += "]";
+
+  String json = "{";
+  json += "\"x\":" + String(posX, 1) + ",";
+  json += "\"y\":" + String(posY, 1) + ",";
+  json += "\"theta\":" + String(theta * RAD_TO_DEG, 1) + ",";
+  json += "\"mode\":\"" + modeStr + "\",";
+  json += "\"dir\":\"" + motorDir + "\",";
+  json += "\"compass\":" + String(compassOK ? "true" : "false") + ",";
+  json += "\"tx\":" + String(targetX, 1) + ",";
+  json += "\"ty\":" + String(targetY, 1) + ",";
+  json += "\"turnAngle\":" + String(turnAngleDeg, 1) + ",";
+  json += "\"turnDir\":\"" + turnDirStr + "\",";
+  json += "\"slowing\":" + String(slowingDown ? "true" : "false") + ",";
+  json += "\"pulse\":" + String(pulseActive ? "true" : "false") + ",";
+  json += "\"pulses\":" + String(pulseCount) + ",";
+  json += "\"flipX\":" + String(compassFlipX ? "true" : "false") + ",";
+  json += "\"flipY\":" + String(compassFlipY ? "true" : "false") + ",";
+  json += "\"resetIn\":" + String(resetCountdownMs) + ",";
+  json += "\"obstacle\":" + String(obstacleAvoidEnabled ? "true" : "false") + ",";
+  json += "\"distance\":" + String(obstacleDistance, 1) + ",";
+  json += "\"servoAngle\":" + String(currentServoAngle) + ",";
+  json += "\"path\":" + pathJSON;
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ─── API: /goto ─────────────────────────────────────────────
+void handleGoto() {
+  if (!server.hasArg("x") || !server.hasArg("y")) {
+    server.send(400, "text/plain", "Missing x or y");
+    return;
+  }
+  if (navState == TURNING || navState == MOVING || navState == AVOIDING) {
+    server.send(409, "text/plain", "Busy");
+    return;
+  }
+  if (navState == ARRIVED && pendingAutoReset) {
+    server.send(503, "text/plain", "Waiting for auto-reset");
+    return;
+  }
+
+  resetPositionOnly();
+
+  float relX = server.arg("x").toFloat();
+  float relY = server.arg("y").toFloat();
+  targetX    = relX;
+  targetY    = relY;
+  targetDist = sqrtf(relX * relX + relY * relY);
+
+  if (targetDist < DIST_TOL) {
+    server.send(200, "text/plain", "Already there");
+    return;
+  }
+
+  targetHeading = atan2f(relY, relX);
+  if (targetHeading < 0) targetHeading += 2.0f * PI;
+
+  navState          = TURNING;
+  persistentTurnDir = 0;
+  directionLocked   = false;
+  pulseActive       = false;
+  pulseCount        = 0;
+
+  server.send(200, "text/plain", "OK");
+}
+
+// ─── API: /obstacle ─────────────────────────────────────────
+void handleObstacle() {
+  if (!server.hasArg("enable")) {
+    server.send(400, "text/plain", "Thiếu tham số enable");
+    return;
+  }
+  String val = server.arg("enable");
+  if (val == "1" || val == "true") {
+    if (navState == TURNING || navState == MOVING) {
+      server.send(409, "text/plain", "Xe đang bận");
+      return;
+    }
+    motorStop();
+    navState = AVOIDING;
+    obstacleAvoidEnabled = true;
+    avoidState = AV_FORWARD;
+    avoidActionActive = false;
+    avoidScanPhase = 0;
+    setServoAngle(90);
+    obstacleConfirmed = false;
+    server.send(200, "text/plain", "Obstacle mode ON (no cooldown)");
+  } else {
+    if (navState == AVOIDING) {
+      motorStop();
+      navState = IDLE;
+    }
+    obstacleAvoidEnabled = false;
+    server.send(200, "text/plain", "Obstacle mode OFF");
+  }
+}
+
+// ─── API: /stop ──────────────────────────────────────────────
+void handleStop() {
+  motorStop();
+  navState = IDLE;
+  pendingAutoReset = false;
+  directionLocked = false;
+  pulseCount = 0;
+  obstacleAvoidEnabled = false;
+  server.send(200, "text/plain", "OK");
+}
+
+// ─── API: /reset ─────────────────────────────────────────────
+void handleReset() {
+  motorStop();
+  navState = IDLE;
+  pendingAutoReset = false;
+  posX = 0; posY = 0; theta = 0; filteredTheta = 0;
+  thetaInitialized = false;
+  targetX = 0; targetY = 0; pathLen = 0;
+  noInterrupts();
+  rawCountL = 0; rawCountR = 0;
+  odomPrevL = 0; odomPrevR = 0;
+  moveStartL = 0; moveStartR = 0;
+  interrupts();
+  lastManualCmdMs = millis();
+  directionLocked = false;
+  pulseActive = false; pulseCount = 0;
+  obstacleAvoidEnabled = false;
+  server.send(200, "text/plain", "Full reset OK");
+}
+
+// ─── API: /resetpos ──────────────────────────────────────────
+void handleResetPosition() {
+  if (navState == TURNING || navState == MOVING || navState == AVOIDING) {
+    server.send(409, "text/plain", "Busy");
+    return;
+  }
+  motorStop();
+  navState = IDLE;
+  pendingAutoReset = false;
+  resetPositionOnly();
+  lastManualCmdMs = millis();
+  directionLocked = false;
+  pulseActive = false; pulseCount = 0;
+  obstacleAvoidEnabled = false;
+  server.send(200, "text/plain", "Position reset OK");
+}
+
+// ─── API: /setspeed ──────────────────────────────────────────
+void handleSetSpeed() {
+  if (server.hasArg("move")) moveSpeed = constrain(server.arg("move").toInt(), 0, 255);
+  if (server.hasArg("turn")) turnSpeed = constrain(server.arg("turn").toInt(), 0, 255);
+  server.send(200, "text/plain", "Speed updated");
+}
+
+// ─── API: /compassconfig ─────────────────────────────────────
+void handleCompassConfig() {
+  if (server.hasArg("flipX")) { String v = server.arg("flipX"); compassFlipX = (v=="1"||v=="true"); }
+  if (server.hasArg("flipY")) { String v = server.arg("flipY"); compassFlipY = (v=="1"||v=="true"); }
+  server.send(200, "text/plain", "Compass config updated");
+}
+
+// ─── SETUP ───────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n[SYS] Booting v3.26 (no‑cooldown avoid)...");
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  motorStop();
+
+  ledcSetup(PWM_CH_LEFT, PWM_FREQ, PWM_RES);
+  ledcSetup(PWM_CH_RIGHT, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENA, PWM_CH_LEFT);
+  ledcAttachPin(ENB, PWM_CH_RIGHT);
+  ledcWrite(PWM_CH_LEFT, 0); ledcWrite(PWM_CH_RIGHT, 0);
+
+  pinMode(ENC_L, INPUT_PULLUP); pinMode(ENC_R, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L), isrEncL, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_R), isrEncR, RISING);
+
+  pinMode(TRIG, OUTPUT); pinMode(ECHO, INPUT);
+  digitalWrite(TRIG, LOW);
+
+  ledcSetup(SERVO_CHANNEL, 50, 16);
+  ledcAttachPin(SERVO_PIN, SERVO_CHANNEL);
+  setServoAngle(90);
+  Serial.println("[SERVO] Ready at 90°");
+
+  Wire.begin(21, 22);
+  if (mag.begin()) {
+    compassOK = true;
+    updateCompassTheta();
+    Serial.printf("[OK] Compass ready --- init θ=%.1f°\n", theta * RAD_TO_DEG);
+  } else {
+    Serial.println("[WARN] No compass --- encoder odometry mode");
+  }
+
+  WiFi.begin(SSID, PASSWORD);
+  Serial.print("[WiFi] Connecting");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n[WiFi] IP: " + WiFi.localIP().toString());
+
+  server.enableCORS(true);
+  server.on("/forward", []() {
+    if (navState == IDLE || navState == ARRIVED) { motorForward(); lastManualCmdMs = millis(); }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/backward", []() {
+    if (navState == IDLE || navState == ARRIVED) { motorBackward(); lastManualCmdMs = millis(); }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/left", []() {
+    if (navState == IDLE || navState == ARRIVED) { motorTurnLeft(); lastManualCmdMs = millis(); }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/right", []() {
+    if (navState == IDLE || navState == ARRIVED) { motorTurnRight(); lastManualCmdMs = millis(); }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/stop", handleStop);
+  server.on("/goto", handleGoto);
+  server.on("/data", handleData);
+  server.on("/reset", handleReset);
+  server.on("/resetpos", handleResetPosition);
+  server.on("/setspeed", handleSetSpeed);
+  server.on("/compassconfig", handleCompassConfig);
+  server.on("/obstacle", handleObstacle);
+  server.begin();
+
+  lastManualCmdMs = millis();
+  lastCorrectMs = 0;
+  lastPulseMs = 0;
+  Serial.println("[SYS] Ready! v3.26 (obstacle: lùi 30cm → quét servo → quay 90°)");
+}
+
+// ─── LOOP ────────────────────────────────────────────────────
+void loop() {
+  server.handleClient();
+  unsigned long now = millis();
+
+  static unsigned long lastDistMs = 0;
+  if (now - lastDistMs >= 100) {
+    lastDistMs = now;
+    obstacleDistance = measureDistance();
+  }
+
+  if ((navState == IDLE || navState == ARRIVED) && motorIsRunning && (now - lastManualCmdMs) > CMD_TIMEOUT_MS) {
+    motorStop();
+  }
+
+  if (navState == ARRIVED && pendingAutoReset && (now - arrivedAtMs) >= RESET_DELAY_MS) {
+    pendingAutoReset = false;
+    navState = IDLE;
+    resetPositionOnly();
+    Serial.println("[SYS] Auto-reset position → (0,0)");
+  }
+
+  static unsigned long lastOdomMs = 0;
+  if (now - lastOdomMs >= (unsigned long)NAV_INTERVAL) {
+    lastOdomMs = now;
+    if (navState == IDLE || navState == ARRIVED) updateOdometry();
+  }
+
+  if (navState != IDLE && navState != ARRIVED && (now - lastNavMs) >= (unsigned long)NAV_INTERVAL) {
+    lastNavMs = now;
+    runNavigation();
+  }
+}
