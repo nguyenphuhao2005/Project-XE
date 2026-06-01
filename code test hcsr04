@@ -1,0 +1,42 @@
+// ============================================================
+//  ESP32 Servo Test (LEDC) – Nhập góc qua Serial
+// ============================================================
+//  Kết nối servo vào chân 12 (có thể đổi SERVO_PIN)
+//  Mở Serial Monitor (115200 baud), nhập số và Enter
+
+#include <Arduino.h>
+
+#define SERVO_PIN     12
+#define SERVO_CHANNEL 2
+
+void setServoAngle(int angle) {
+  angle = constrain(angle, 0, 180);
+  // duty range cho servo thông thường: 1638 (0°) -> 8191 (180°)
+  uint32_t duty = map(angle, 0, 180, 1638, 8191);
+  ledcWrite(SERVO_CHANNEL, duty);
+}
+
+void setup() {
+  Serial.begin(115200);
+  ledcSetup(SERVO_CHANNEL, 50, 16);        // 50 Hz, 16-bit
+  ledcAttachPin(SERVO_PIN, SERVO_CHANNEL);
+  setServoAngle(90);                       // về giữa
+  Serial.println("Servo test ready. Nhap goc (0-180):");
+}
+
+void loop() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() > 0) {
+      int angle = input.toInt();
+      if (angle >= 0 && angle <= 180) {
+        setServoAngle(angle);
+        Serial.print("Da dat goc: ");
+        Serial.println(angle);
+      } else {
+        Serial.println("Goc khong hop le (0-180)!");
+      }
+    }
+  }
+}
