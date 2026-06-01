@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>CAR CTRL v3.5 (Servo Scan)</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@400;600;700&display=swap');
+  :root {
+    --bg:      #0a0c0f;
+    --surface: #111418;
+    --panel:   #161b22;
+    --border:  #21262d;
+    --accent:  #00e5ff;
+    --ok:      #39d353;
+    --warn:    #f0a500;
+    --danger:  #f85149;
+    --text:    #c9d1d9;
+    --muted:   #484f58;
+    --mono:    'Share Tech Mono', monospace;
+    --sans:    'Barlow', sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); overflow-x: hidden; }
+  body { display: grid; grid-template-rows: auto 1fr; min-height: 100vh; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 18px; background: var(--surface);
+    border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 8px;
+  }
+  .logo { font-family: var(--mono); font-size: 14px; color: var(--accent); letter-spacing: 2px; }
+  .logo span { color: var(--muted); }
+  .status-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .chip { display: flex; align-items: center; gap: 5px; padding: 3px 10px;
+          background: var(--panel); border: 1px solid var(--border);
+          border-radius: 4px; font-family: var(--mono); font-size: 11px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .dot.ok    { background: var(--ok);     box-shadow: 0 0 6px var(--ok); }
+  .dot.error { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+  .dot.pulse { animation: blink 1s ease-in-out infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .ip-input { background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+              padding: 3px 8px; color: var(--accent); font-family: var(--mono);
+              font-size: 11px; width: 130px; outline: none; }
+  .ip-input:focus { border-color: var(--accent); }
+  main { display: grid; grid-template-columns: 1fr 290px; height: 100%; min-height: 0; }
+  @media (max-width: 700px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr auto; } }
+  /* MAP */
+  .map-panel { position: relative; background: var(--surface);
+               border-right: 1px solid var(--border);
+               display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  #mapCanvas { display: block; cursor: crosshair; }
+  .map-hint {
+    position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+    font-size: 11px; font-family: var(--mono); pointer-events: none; white-space: nowrap;
+    padding: 4px 12px; border-radius: 4px; background: rgba(10,12,15,0.88);
+    border: 1px solid var(--border); transition: color .3s, border-color .3s;
+  }
+  .map-hint.pending { color: var(--warn);   border-color: rgba(240,165,0,.4); }
+  .map-hint.arrived { color: var(--ok);     border-color: rgba(57,211,83,.4); }
+  .map-hint.locked  { color: var(--danger); border-color: rgba(248,81,73,.3); }
+  .map-hint.normal  { color: var(--muted);  border-color: var(--border); }
+  .arrived-overlay {
+    display: none; position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    background: rgba(57,211,83,.1); border: 1px solid rgba(57,211,83,.35);
+    border-radius: 8px; padding: 10px 20px; text-align: center;
+    font-family: var(--mono); pointer-events: none; min-width: 200px;
+  }
+  .arrived-overlay.visible { display: block; }
+  .arrived-title { color: var(--ok); font-size: 12px; letter-spacing: 2px; margin-bottom: 4px; }
+  .arrived-bar-wrap { height: 4px; background: rgba(57,211,83,.15); border-radius: 2px; overflow: hidden; margin: 6px 0; }
+  .arrived-bar { height: 100%; background: var(--ok); border-radius: 2px; width: 100%;
+                 transition: width .1s linear; }
+  .arrived-sub { color: #39d353; font-size: 11px; }
+  .scale-bar { position: absolute; bottom: 12px; right: 16px;
+               display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+  .scale-line { width: 60px; height: 2px; background: var(--muted);
+                border-left: 2px solid var(--muted); border-right: 2px solid var(--muted); }
+  .scale-label { font-size: 10px; color: var(--muted); font-family: var(--mono); }
+  /* SIDE */
+  .side-panel { background: var(--panel); display: flex; flex-direction: column;
+                overflow-y: auto; overflow-x: hidden; }
+  .section { padding: 13px 15px; border-bottom: 1px solid var(--border); }
+  .section-title { font-size: 10px; letter-spacing: 2px; text-transform: uppercase;
+                   color: var(--muted); margin-bottom: 10px; font-family: var(--mono); }
+  .readouts { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .readout { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .readout-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 3px; }
+  .readout-value { font-family: var(--mono); font-size: 18px; color: var(--accent); line-height: 1; }
+  .readout-unit  { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .dir-indicator {
+    margin-top: 9px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 12px;
+    display: flex; align-items: center; justify-content: space-between;
+    font-family: var(--mono); font-size: 11px;
+  }
+  .dir-label { color: var(--muted); }
+  .dir-value { font-size: 13px; font-weight: 700; letter-spacing: 1px; transition: color .2s; }
+  .dir-value.forward  { color: var(--ok); }
+  .dir-value.backward { color: var(--warn); }
+  .dir-value.left     { color: var(--accent); }
+  .dir-value.right    { color: var(--accent); }
+  .dir-value.stop     { color: var(--muted); }
+  .heading-visual { margin-top: 9px; display: flex; align-items: center; gap: 10px; }
+  .compass-ring { position: relative; width: 52px; height: 52px; flex-shrink: 0; }
+  .compass-ring svg { width: 100%; height: 100%; }
+  .heading-info { font-family: var(--mono); font-size: 11px; color: var(--muted); line-height: 1.85; }
+  .heading-info span { color: var(--text); }
+  .mode-badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
+                border-radius: 4px; font-family: var(--mono); font-size: 11px; font-weight: 600;
+                letter-spacing: 1px; text-transform: uppercase;
+                width: 100%; justify-content: center; transition: all .3s; }
+  .mode-badge.idle    { background: rgba(72,79,88,.25);  color: var(--muted);  border: 1px solid var(--border); }
+  .mode-badge.turning { background: rgba(240,165,0,.15); color: var(--warn);   border: 1px solid rgba(240,165,0,.3); }
+  .mode-badge.moving  { background: rgba(0,229,255,.12); color: var(--accent); border: 1px solid rgba(0,229,255,.3); }
+  .mode-badge.arrived { background: rgba(57,211,83,.12); color: var(--ok);     border: 1px solid rgba(57,211,83,.3); }
+  .mode-badge.avoiding { background: rgba(0,255,200,.12); color: #0ff; border: 1px solid rgba(0,255,200,.3); }
+  /* DPAD */
+  .dpad { display: grid; grid-template-columns: repeat(3,1fr); grid-template-rows: repeat(3,1fr);
+          gap: 6px; width: 100%; max-width: 180px; margin: 0 auto; aspect-ratio: 1; }
+  .dpad-btn { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+              color: var(--text); font-size: 20px; cursor: pointer; display: flex;
+              align-items: center; justify-content: center;
+              transition: background .1s, transform .1s;
+              user-select: none; touch-action: manipulation; -webkit-user-select: none; }
+  .dpad-btn:active { background: rgba(0,229,255,.15); border-color: var(--accent); transform: scale(0.92); }
+  .dpad-btn.stop-btn { background: rgba(248,81,73,.1); border-color: rgba(248,81,73,.35);
+                       color: var(--danger); font-size: 10px; font-family: var(--mono); font-weight: 700; }
+  .dpad-btn.stop-btn:active { background: rgba(248,81,73,.25); }
+  .dpad-empty { pointer-events: none; }
+  /* Nav section */
+  .nav-info { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+              padding: 9px 12px; margin-bottom: 9px; font-family: var(--mono); font-size: 11px; line-height: 1.9; }
+  .ni-row { display: flex; justify-content: space-between; }
+  .ni-key { color: var(--muted); }
+  .ni-val { color: var(--text); }
+  .ni-val.accent { color: var(--accent); }
+  .ni-val.ok     { color: var(--ok); }
+  .ni-val.warn   { color: var(--warn); }
+  .coord-row { display: flex; gap: 7px; margin-bottom: 8px; }
+  .coord-field { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+  .coord-field label { font-size: 10px; color: var(--muted); font-family: var(--mono); letter-spacing: 1px; }
+  .coord-input { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+                 padding: 8px 10px; color: var(--text); font-family: var(--mono);
+                 font-size: 15px; text-align: center; outline: none; width: 100%;
+                 transition: border-color .2s; }
+  .coord-input:focus  { border-color: var(--accent); }
+  .coord-input.pending { border-color: rgba(240,165,0,.6); color: var(--warn); }
+  .coord-input:disabled { opacity: .35; cursor: not-allowed; }
+  .btn-row { display: flex; gap: 7px; }
+  .btn { flex:1; padding: 10px; border: none; border-radius: 6px; font-family: var(--sans);
+         font-weight: 700; font-size: 13px; cursor: pointer; letter-spacing: .5px;
+         transition: opacity .2s, transform .1s; touch-action: manipulation; }
+  .btn:active   { transform: scale(.97); opacity: .85; }
+  .btn:disabled { opacity: .3; cursor: not-allowed; transform: none; }
+  .btn-go  { background: var(--accent); color: #000; }
+  .btn-go.has-pending { background: var(--warn); color: #000; animation: glow-warn 1s ease-in-out infinite; }
+  @keyframes glow-warn { 0%,100%{box-shadow:0 0 6px rgba(240,165,0,.4)} 50%{box-shadow:0 0 16px rgba(240,165,0,.8)} }
+  .btn-stop  { background: var(--danger); color: #fff; }
+  .btn-reset { background: var(--surface); border: 1px solid var(--border); color: var(--text);
+               flex: 0 0 auto; padding: 10px 12px; }
+  .btn-clear { display: none; width: 100%; margin-top: 7px; padding: 7px;
+    background: rgba(240,165,0,.07); border: 1px solid rgba(240,165,0,.25);
+    border-radius: 6px; color: var(--warn); font-family: var(--mono);
+    font-size: 11px; cursor: pointer; letter-spacing: 1px; transition: background .2s; }
+  .btn-clear.visible { display: block; }
+  .btn-clear:hover { background: rgba(240,165,0,.18); }
+  .map-tip { font-size: 11px; color: var(--muted); font-family: var(--mono);
+             text-align: center; margin-top: 8px; }
+  .map-tip span { color: var(--accent); }
+  .obstacle-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .dist-value { font-family: var(--mono); font-size: 18px; color: var(--accent); }
+  .servo-indicator { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">CAR<span>/</span>CTRL <span style="font-size:10px;color:#333">v3.5</span></div>
+  <input class="ip-input" id="ipInput" value="172.20.10.2" placeholder="ESP32 IP"
+         onchange="ESP_IP=this.value.trim()">
+  <div class="status-bar">
+    <div class="chip"><div class="dot error" id="wifiDot"></div><span id="wifiLabel">--</span></div>
+    <div class="chip"><div class="dot error" id="compassDot"></div><span id="compassLabel">COMPASS</span></div>
+  </div>
+</header>
+<main>
+  <div class="map-panel">
+    <canvas id="mapCanvas"></canvas>
+    <div class="arrived-overlay" id="arrivedOverlay">
+      <div class="arrived-title">✓ ĐÃ ĐẾN NƠI</div>
+      <div class="arrived-bar-wrap"><div class="arrived-bar" id="arrivedBar"></div></div>
+      <div class="arrived-sub">Reset về (0,0) sau <b id="arrivedSec">10.0</b>s</div>
+    </div>
+    <div class="map-hint normal" id="mapHint">Click bản đồ chọn đích → bấm GO</div>
+    <div class="scale-bar">
+      <div class="scale-line"></div>
+      <div class="scale-label" id="scaleLabel">-- cm</div>
+    </div>
+  </div>
+  <div class="side-panel">
+    <!-- Vị trí & Hướng -->
+    <div class="section">
+      <div class="section-title">Vị trí & Hướng</div>
+      <div class="readouts">
+        <div class="readout"><div class="readout-label">X</div><div class="readout-value" id="valX">0.0</div><div class="readout-unit">cm</div></div>
+        <div class="readout"><div class="readout-label">Y</div><div class="readout-value" id="valY">0.0</div><div class="readout-unit">cm</div></div>
+        <div class="readout"><div class="readout-label">Hướng θ</div><div class="readout-value" id="valTheta">0.0</div><div class="readout-unit">độ</div></div>
+        <div class="readout" style="display:flex;align-items:center;justify-content:center">
+          <div class="mode-badge idle" id="modeBadge">IDLE</div>
+        </div>
+      </div>
+      <div class="dir-indicator">
+        <span class="dir-label">Chuyển động</span>
+        <span class="dir-value stop" id="dirValue">■ DỪNG</span>
+      </div>
+      <div class="heading-visual">
+        <div class="compass-ring">
+          <svg viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="26" cy="26" r="24" stroke="#21262d" stroke-width="1.5"/>
+            <line x1="26" y1="3"  x2="26" y2="8"  stroke="#484f58" stroke-width="1.5"/>
+            <line x1="26" y1="44" x2="26" y2="49" stroke="#21262d" stroke-width="1"/>
+            <line x1="3"  y1="26" x2="8"  y2="26" stroke="#21262d" stroke-width="1"/>
+            <line x1="44" y1="26" x2="49" y2="26" stroke="#21262d" stroke-width="1"/>
+            <text x="24" y="12" font-size="7" fill="#484f58" font-family="monospace">N</text>
+            <g id="compassNeedle" style="transform-origin:26px 26px">
+              <polygon points="26,6 29,26 26,23 23,26"  fill="#00e5ff" opacity=".9"/>
+              <polygon points="26,46 29,26 26,29 23,26" fill="#484f58" opacity=".6"/>
+            </g>
+            <circle cx="26" cy="26" r="3" fill="#0d1117" stroke="#484f58" stroke-width="1"/>
+          </svg>
+        </div>
+        <div class="heading-info">
+          Hướng: <span id="hi_theta">0.0°</span><br>
+          Đích θ: <span id="hi_target">--</span><br>
+          Quay: <span id="hi_turn">--</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Điều khiển tay -->
+    <div class="section">
+      <div class="section-title">Điều khiển tay</div>
+      <div class="dpad">
+        <div class="dpad-empty"></div>
+        <button class="dpad-btn"
+          onmousedown="pressCmd('forward')" onmouseup="releaseCmd()"
+          ontouchstart="pressCmd('forward')" ontouchend="releaseCmd()">↑</button>
+        <div class="dpad-empty"></div>
+        <button class="dpad-btn"
+          onmousedown="pressCmd('left')" onmouseup="releaseCmd()"
+          ontouchstart="pressCmd('left')" ontouchend="releaseCmd()">←</button>
+        <button class="dpad-btn stop-btn" onclick="emergencyStop()">STOP</button>
+        <button class="dpad-btn"
+          onmousedown="pressCmd('right')" onmouseup="releaseCmd()"
+          ontouchstart="pressCmd('right')" ontouchend="releaseCmd()">→</button>
+        <div class="dpad-empty"></div>
+        <button class="dpad-btn"
+          onmousedown="pressCmd('backward')" onmouseup="releaseCmd()"
+          ontouchstart="pressCmd('backward')" ontouchend="releaseCmd()">↓</button>
+        <div class="dpad-empty"></div>
+      </div>
+    </div>
+
+    <!-- Tự hành né vật cản (có servo scan) -->
+    <div class="section">
+      <div class="section-title">Tự hành né vật cản (Servo Scan)</div>
+      <div class="obstacle-row">
+        <span style="font-family:var(--mono); font-size:12px; color:var(--muted);">Khoảng cách:</span>
+        <span class="dist-value" id="distVal">--</span>
+        <span style="font-size:10px; color:var(--muted);">cm</span>
+      </div>
+      <div style="display:flex; justify-content:space-between; margin:6px 0;">
+        <span class="servo-indicator">Servo:</span>
+        <span id="servoAngleVal" style="font-family:var(--mono); color:var(--accent);">90°</span>
+      </div>
+      <button id="btnObstacle" class="btn" style="background:var(--surface); border:1px solid var(--border); color:var(--text);"
+              onclick="toggleObstacle()">Bật né vật cản</button>
+    </div>
+
+    <!-- Điều hướng tự động -->
+    <div class="section">
+      <div class="section-title">Điều hướng tự động</div>
+      <div class="nav-info" id="navInfo">
+        <div class="ni-row"><span class="ni-key">Vị trí hiện tại</span><span class="ni-val accent" id="ni_pos">(0.0, 0.0)</span></div>
+        <div class="ni-row"><span class="ni-key">Điểm đến (ΔX,ΔY)</span><span class="ni-val" id="ni_target">--</span></div>
+        <div class="ni-row"><span class="ni-key">Khoảng cách</span><span class="ni-val" id="ni_dist">--</span></div>
+        <div class="ni-row"><span class="ni-key">Góc quay</span><span class="ni-val" id="ni_turn">--</span></div>
+      </div>
+      <div class="coord-row">
+        <div class="coord-field">
+          <label>ΔX (cm)</label>
+          <input class="coord-input" id="inX" type="number" value="0" step="5">
+        </div>
+        <div class="coord-field">
+          <label>ΔY (cm)</label>
+          <input class="coord-input" id="inY" type="number" value="0" step="5">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-go" id="btnGo" onclick="sendGoto()">▶ GO</button>
+        <button class="btn btn-stop" onclick="emergencyStop()">■ STOP</button>
+        <button class="btn btn-reset" onclick="resetAll()" title="Reset toàn bộ (θ=0)">↺</button>
+        <button class="btn btn-reset" onclick="resetPositionOnlyWeb()" title="Reset tọa độ về (0,0), giữ hướng">↻ Pos</button>
+      </div>
+      <button class="btn-clear" id="btnClear" onclick="clearPending()">✕ XÓA ĐIỂM ĐANG CHỌN</button>
+      <div class="map-tip">Hoặc <span>click bản đồ</span> → chọn điểm → <span>GO</span></div>
+    </div>
+  </div>
+</main>
+
+<script>
+let ESP_IP = document.getElementById('ipInput').value;
+const RESET_DELAY_SEC = 10;
+
+// State
+let carX = 0, carY = 0, carTheta = 0;
+let carDir = 'stop';
+let activeTargetX = 0, activeTargetY = 0;
+let carMode = 'idle';
+let compassOK = false;
+let pathPoints = [];
+let resetInMs  = -1;
+let pendingTarget = null;
+let holdTimer = null;
+let mapScale  = 3;
+let mapOffX = 0, mapOffY = 0;
+let obstacleActive = false;
+
+const canvas = document.getElementById('mapCanvas');
+const ctx    = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const p = canvas.parentElement;
+  canvas.width  = p.clientWidth;
+  canvas.height = p.clientHeight;
+  mapOffX = canvas.width  / 2;
+  mapOffY = canvas.height / 2;
+  drawMap();
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function worldToCanvas(wx, wy) {
+  return { cx: mapOffX + wx * mapScale, cy: mapOffY - wy * mapScale };
+}
+function canvasToWorld(cx, cy) {
+  return { wx: (cx - mapOffX) / mapScale, wy: -(cy - mapOffY) / mapScale };
+}
+function wrapAngle(deg) {
+  while (deg >  180) deg -= 360;
+  while (deg < -180) deg += 360;
+  return deg;
+}
+
+// ─── DRAW ───────────────────────────────────────────────────
+function drawMap() {
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = '#0d1117'; ctx.fillRect(0,0,W,H);
+  // Grid
+  const gs = 20 * mapScale;
+  ctx.strokeStyle = '#161b22'; ctx.lineWidth = 1;
+  for (let x = ((mapOffX % gs)+gs)%gs; x < W; x += gs) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = ((mapOffY % gs)+gs)%gs; y < H; y += gs) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  // Axes
+  const o = worldToCanvas(0,0);
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(o.cx,0); ctx.lineTo(o.cx,H); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,o.cy); ctx.lineTo(W,o.cy); ctx.stroke();
+  ctx.fillStyle = '#2a3040'; ctx.font = '10px Share Tech Mono,monospace';
+  ctx.fillText('X+', W-22, o.cy-5); ctx.fillText('Y+', o.cx+5, 13);
+  ctx.fillStyle = '#484f58'; ctx.beginPath(); ctx.arc(o.cx,o.cy,3,0,2*Math.PI); ctx.fill();
+  // Path
+  if (pathPoints.length > 1) {
+    ctx.strokeStyle = 'rgba(0,229,255,0.2)'; ctx.lineWidth = 2; ctx.beginPath();
+    const p0 = worldToCanvas(pathPoints[0][0], pathPoints[0][1]);
+    ctx.moveTo(p0.cx, p0.cy);
+    for (let i=1; i<pathPoints.length; i++) {
+      const p = worldToCanvas(pathPoints[i][0], pathPoints[i][1]);
+      ctx.lineTo(p.cx, p.cy);
+    }
+    ctx.stroke();
+  }
+  // Active target
+  if (carMode === 'turning' || carMode === 'moving') {
+    const t = worldToCanvas(activeTargetX, activeTargetY);
+    const ring = (Date.now() % 1000) / 1000;
+    ctx.strokeStyle = `rgba(255,107,53,${1-ring})`; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(t.cx, t.cy, 8+ring*16, 0, 2*Math.PI); ctx.stroke();
+    ctx.strokeStyle = '#ff6b35'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(t.cx-10,t.cy); ctx.lineTo(t.cx+10,t.cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(t.cx,t.cy-10); ctx.lineTo(t.cx,t.cy+10); ctx.stroke();
+    ctx.fillStyle = '#ff6b35'; ctx.font = '10px Share Tech Mono,monospace';
+    ctx.fillText(`(${activeTargetX.toFixed(0)},${activeTargetY.toFixed(0)})`, t.cx+12, t.cy-8);
+    const car = worldToCanvas(carX, carY);
+    ctx.strokeStyle = 'rgba(255,107,53,0.2)'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(car.cx,car.cy); ctx.lineTo(t.cx,t.cy); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // Arrived
+  if (carMode === 'arrived') {
+    const t = worldToCanvas(activeTargetX, activeTargetY);
+    ctx.fillStyle = 'rgba(57,211,83,.08)'; ctx.beginPath(); ctx.arc(t.cx,t.cy,16,0,2*Math.PI); ctx.fill();
+    ctx.strokeStyle = '#39d353'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(t.cx,t.cy,16,0,2*Math.PI); ctx.stroke();
+    ctx.fillStyle = '#39d353'; ctx.font = '11px Share Tech Mono,monospace';
+    ctx.fillText(`✓ (${activeTargetX.toFixed(0)},${activeTargetY.toFixed(0)})`, t.cx+20, t.cy+4);
+  }
+  // Pending target
+  if (pendingTarget) {
+    const t = worldToCanvas(pendingTarget.x, pendingTarget.y);
+    ctx.strokeStyle = '#f0a500'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(t.cx,t.cy,12,0,2*Math.PI); ctx.stroke();
+    ctx.strokeStyle = 'rgba(240,165,0,.5)'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(t.cx-8,t.cy); ctx.lineTo(t.cx+8,t.cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(t.cx,t.cy-8); ctx.lineTo(t.cx,t.cy+8); ctx.stroke();
+    ctx.fillStyle = '#f0a500'; ctx.font = 'bold 10px Share Tech Mono,monospace';
+    ctx.fillText(`→(${pendingTarget.x.toFixed(0)},${pendingTarget.y.toFixed(0)})`, t.cx+15, t.cy+4);
+    const car = worldToCanvas(carX, carY);
+    const dx = pendingTarget.x - carX, dy = pendingTarget.y - carY;
+    const dist = Math.sqrt(dx*dx+dy*dy);
+    if (dist > 2) {
+      ctx.strokeStyle = 'rgba(240,165,0,0.25)'; ctx.lineWidth=1; ctx.setLineDash([3,4]);
+      ctx.beginPath(); ctx.moveTo(car.cx,car.cy); ctx.lineTo(t.cx,t.cy); ctx.stroke();
+      ctx.setLineDash([]);
+      const mx = (car.cx+t.cx)/2, my = (car.cy+t.cy)/2;
+      ctx.fillStyle = 'rgba(240,165,0,.6)'; ctx.font='9px Share Tech Mono,monospace';
+      ctx.fillText(`${dist.toFixed(1)}cm`, mx+4, my-3);
+    }
+  }
+  // Xe
+  const car = worldToCanvas(carX, carY);
+  ctx.save();
+  ctx.translate(car.cx, car.cy);
+  const thetaRad = carTheta * Math.PI / 180;
+  ctx.rotate(Math.PI/2 - thetaRad);
+  const bw = 14*mapScale/3, bh = 18*mapScale/3;
+  let bodyFill, bodyStroke;
+  if (carMode === 'idle' || carDir === 'stop') {
+    bodyFill = '#1a1f26'; bodyStroke = '#484f58';
+  } else if (carDir === 'backward') {
+    bodyFill = 'rgba(240,165,0,0.12)'; bodyStroke = '#f0a500';
+  } else {
+    bodyFill = 'rgba(0,229,255,0.12)'; bodyStroke = '#00e5ff';
+  }
+  ctx.fillStyle = bodyFill; ctx.strokeStyle = bodyStroke; ctx.lineWidth = 1.5;
+  roundRect(ctx,-bw/2,-bh/2,bw,bh,3); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = bodyStroke;
+  ctx.beginPath(); ctx.moveTo(0,-bh/2-5); ctx.lineTo(-4,-bh/2+2); ctx.lineTo(4,-bh/2+2); ctx.closePath(); ctx.fill();
+  if (carDir === 'backward') {
+    ctx.fillStyle = '#f0a500';
+    ctx.beginPath(); ctx.moveTo(0,bh/2+5); ctx.lineTo(-4,bh/2-2); ctx.lineTo(4,bh/2-2); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+  ctx.fillStyle = '#c9d1d9'; ctx.font='10px Share Tech Mono,monospace';
+  ctx.fillText(`(${carX.toFixed(0)},${carY.toFixed(0)})`, car.cx+14, car.cy+4);
+  document.getElementById('scaleLabel').textContent = Math.round(60/mapScale)+'cm';
+  if (carMode!=='idle' || pendingTarget) requestAnimationFrame(drawMap);
+}
+function roundRect(ctx,x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y);
+  ctx.closePath();
+}
+// ─── MAP CLICK ──────────────────────────────────────────────
+canvas.addEventListener('click', e => {
+  if (carMode==='turning'||carMode==='moving') return;
+  if (carMode==='arrived') { setHint('Đợi reset xong (10s) mới chọn điểm tiếp','locked'); return; }
+  const rect = canvas.getBoundingClientRect();
+  const { wx, wy } = canvasToWorld(e.clientX-rect.left, e.clientY-rect.top);
+  const relX = parseFloat((wx - carX).toFixed(1));
+  const relY = parseFloat((wy - carY).toFixed(1));
+  pendingTarget = { x: parseFloat(wx.toFixed(1)), y: parseFloat(wy.toFixed(1)) };
+  document.getElementById('inX').value = relX;
+  document.getElementById('inY').value = relY;
+  document.getElementById('inX').classList.add('pending');
+  document.getElementById('inY').classList.add('pending');
+  document.getElementById('btnGo').classList.add('has-pending');
+  document.getElementById('btnClear').classList.add('visible');
+  const dist = Math.sqrt(relX*relX+relY*relY);
+  const targetDeg = Math.atan2(relY, relX) * 180/Math.PI;
+  const turnDeg   = wrapAngle(targetDeg - carTheta);
+  const dir = turnDeg > 0 ? '← trái' : '→ phải';
+  setHint(`ΔX=${relX} ΔY=${relY} | ${dist.toFixed(1)}cm | quay ${Math.abs(turnDeg).toFixed(0)}° ${dir}`, 'pending');
+  updateNavInfo(relX, relY);
+  drawMap();
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  mapScale = Math.max(0.5, Math.min(20, mapScale*(e.deltaY<0?1.15:0.87)));
+  drawMap();
+}, { passive:false });
+// ─── HELPERS ────────────────────────────────────────────────
+function clearPending() {
+  pendingTarget = null;
+  document.getElementById('inX').classList.remove('pending');
+  document.getElementById('inY').classList.remove('pending');
+  document.getElementById('btnGo').classList.remove('has-pending');
+  document.getElementById('btnClear').classList.remove('visible');
+  setHint('Click bản đồ chọn đích → bấm GO', 'normal');
+  updateNavInfo(null, null);
+  drawMap();
+}
+function setHint(text, cls) {
+  const h = document.getElementById('mapHint');
+  h.textContent = text; h.className = 'map-hint ' + cls;
+}
+function updateNavInfo(relX, relY) {
+  if (relX === null) {
+    ['ni_target','ni_dist','ni_turn','hi_target','hi_turn'].forEach(id =>
+      document.getElementById(id).textContent = '--');
+    return;
+  }
+  const dist = Math.sqrt(relX*relX+relY*relY);
+  const targetDeg = ((Math.atan2(relY, relX)*180/Math.PI) % 360 + 360) % 360;
+  const turnDeg   = wrapAngle(targetDeg - carTheta);
+  const dir = turnDeg > 0 ? '↺ trái' : '↻ phải';
+  document.getElementById('ni_target').textContent  = `(${relX.toFixed(1)}, ${relY.toFixed(1)}) cm`;
+  document.getElementById('ni_dist').textContent    = `${dist.toFixed(2)} cm`;
+  document.getElementById('ni_turn').textContent    = `${Math.abs(turnDeg).toFixed(1)}° ${dir}`;
+  document.getElementById('hi_target').textContent  = `${targetDeg.toFixed(1)}°`;
+  document.getElementById('hi_turn').textContent    = `${turnDeg.toFixed(1)}° ${dir}`;
+}
+// ─── DIRECTION INDICATOR ────────────────────────────────
+function updateDirIndicator(dir) {
+  const el = document.getElementById('dirValue');
+  const map = {
+    forward:  { cls: 'forward',  label: '▲ TIẾN' },
+    backward: { cls: 'backward', label: '▼ LÙI'  },
+    left:     { cls: 'left',     label: '◄ TRÁI'  },
+    right:    { cls: 'right',    label: '► PHẢI'  },
+    stop:     { cls: 'stop',     label: '■ DỪNG'  },
+  };
+  const { cls, label } = map[dir] || map.stop;
+  el.className = 'dir-value ' + cls;
+  el.textContent = label;
+}
+// ─── OBSTACLE TOGGLE ────────────────────────────────────────
+function toggleObstacle() {
+  const enable = !obstacleActive;
+  fetch(`http://${ESP_IP}/obstacle?enable=${enable ? 1 : 0}`)
+    .then(r => r.text())
+    .then(msg => {
+      obstacleActive = enable;
+      updateObstacleButton();
+    })
+    .catch(() => alert('Lỗi kết nối'));
+}
+function updateObstacleButton() {
+  const btn = document.getElementById('btnObstacle');
+  if (obstacleActive) {
+    btn.textContent = 'Tắt né vật cản';
+    btn.style.background = 'var(--accent)';
+    btn.style.color = '#000';
+  } else {
+    btn.textContent = 'Bật né vật cản';
+    btn.style.background = 'var(--surface)';
+    btn.style.color = 'var(--text)';
+  }
+}
+// ─── API ────────────────────────────────────────────────────
+function api(ep) {
+  return fetch(`http://${ESP_IP}${ep}`)
+    .then(r => r.ok ? r.text() : Promise.reject(r))
+    .catch(() => setWifiStatus(false));
+}
+function pressCmd(cmd) {
+  api('/'+cmd);
+  holdTimer = setInterval(() => api('/'+cmd), 120);
+}
+function releaseCmd() { clearInterval(holdTimer); holdTimer=null; api('/stop'); }
+function emergencyStop() { clearInterval(holdTimer); holdTimer=null; api('/stop'); }
+function sendGoto() {
+  if (carMode==='turning'||carMode==='moving') return;
+  if (carMode==='arrived') { alert('Đang đếm ngược reset 10s, xin chờ...'); return; }
+  const relX = parseFloat(document.getElementById('inX').value);
+  const relY = parseFloat(document.getElementById('inY').value);
+  if (isNaN(relX)||isNaN(relY)) return;
+  if (Math.sqrt(relX*relX+relY*relY) < 2) { alert('Điểm đến quá gần!'); return; }
+  activeTargetX = carX + relX;
+  activeTargetY = carY + relY;
+  clearPending();
+  api(`/goto?x=${relX.toFixed(1)}&y=${relY.toFixed(1)}`);
+  carMode = 'turning';
+  setHint(`Điều hướng tới ΔX=${relX.toFixed(0)} ΔY=${relY.toFixed(0)}...`, 'normal');
+  drawMap();
+}
+function resetAll() {
+  api('/reset').then(() => {
+    carX=0; carY=0; carTheta=0; carDir='stop';
+    activeTargetX=0; activeTargetY=0;
+    carMode='idle'; pathPoints=[];
+    resetInMs=-1;
+    obstacleActive = false; updateObstacleButton();
+    clearPending();
+    updateUI(); drawMap();
+    setHint('Reset xong --- chọn điểm đến', 'normal');
+  });
+}
+function resetPositionOnlyWeb() {
+  if (carMode === 'turning' || carMode === 'moving') {
+    alert('Xe đang di chuyển, không thể reset vị trí lúc này');
+    return;
+  }
+  api('/resetpos')
+    .then(() => {
+      carX = 0; carY = 0;
+      pathPoints = [];
+      activeTargetX = 0; activeTargetY = 0;
+      resetInMs = -1;
+      if (carMode === 'arrived') {
+        carMode = 'idle';
+        document.getElementById('arrivedOverlay').classList.remove('visible');
+        document.getElementById('btnGo').disabled = false;
+        document.getElementById('inX').disabled   = false;
+        document.getElementById('inY').disabled   = false;
+      }
+      clearPending();
+      updateUI();
+      drawMap();
+      setHint('Đã reset tọa độ về (0,0)', 'normal');
+    })
+    .catch(() => alert('Lỗi reset tọa độ'));
+}
+// ─── POLL ───────────────────────────────────────────────────
+function pollData() {
+  fetch(`http://${ESP_IP}/data`)
+    .then(r => r.json())
+    .then(d => {
+      const prev = carMode;
+      carX     = d.x;
+      carY     = d.y;
+      carTheta = d.theta;
+      carMode  = d.mode;
+      carDir   = d.dir || 'stop';
+      compassOK  = d.compass;
+      pathPoints = d.path || [];
+      resetInMs  = d.resetIn != null ? d.resetIn : -1;
+      if (carMode !== 'idle') { activeTargetX = d.tx; activeTargetY = d.ty; }
+      if (prev === 'arrived' && carMode === 'idle') {
+        setHint('Reset về (0,0) --- chọn điểm đến tiếp theo', 'normal');
+        document.getElementById('btnGo').disabled = false;
+        document.getElementById('inX').disabled   = false;
+        document.getElementById('inY').disabled   = false;
+      }
+      // Obstacle state
+      if (d.obstacle !== undefined) {
+        obstacleActive = d.obstacle;
+        updateObstacleButton();
+      }
+      if (d.distance !== undefined) {
+        document.getElementById('distVal').textContent = d.distance.toFixed(1);
+      }
+      if (d.servoAngle !== undefined) {
+        document.getElementById('servoAngleVal').textContent = d.servoAngle + '°';
+      }
+      updateUI(); drawMap(); setWifiStatus(true);
+    })
+    .catch(() => setWifiStatus(false));
+}
+// ─── UPDATE UI ──────────────────────────────────────────────
+function updateUI() {
+  document.getElementById('valX').textContent     = carX.toFixed(1);
+  document.getElementById('valY').textContent     = carY.toFixed(1);
+  document.getElementById('valTheta').textContent = carTheta.toFixed(1);
+  const needle = document.getElementById('compassNeedle');
+  if (needle) needle.style.transform = `rotate(${-carTheta}deg)`;
+  document.getElementById('hi_theta').textContent = `${carTheta.toFixed(1)}°`;
+  const badge = document.getElementById('modeBadge');
+  const M = {
+    idle:     ['IDLE',     'idle'],
+    turning:  ['QUAY...',  'turning'],
+    moving:   ['TIẾN...',  'moving'],
+    arrived:  ['ĐẾN NƠI',  'arrived'],
+    avoiding: ['NÉ...',    'avoiding']
+  };
+  const [lbl,cls] = M[carMode] || ['--','idle'];
+  badge.textContent = lbl; badge.className = 'mode-badge ' + cls;
+  updateDirIndicator(carDir);
+  document.getElementById('ni_pos').textContent = `(${carX.toFixed(1)}, ${carY.toFixed(1)})`;
+  if ((carMode==='turning'||carMode==='moving') && !pendingTarget) {
+    updateNavInfo(activeTargetX-carX, activeTargetY-carY);
+  }
+  // ARRIVED countdown
+  const overlay = document.getElementById('arrivedOverlay');
+  const bar     = document.getElementById('arrivedBar');
+  const secEl   = document.getElementById('arrivedSec');
+  if (carMode==='arrived' && resetInMs>=0) {
+    overlay.classList.add('visible');
+    const sec = (resetInMs/1000).toFixed(1);
+    secEl.textContent = sec;
+    bar.style.width   = Math.max(0, (resetInMs / (RESET_DELAY_SEC*1000))*100) + '%';
+    setHint(`ĐẾN NƠI! Reset về (0,0) sau ${sec}s...`, 'arrived');
+    document.getElementById('btnGo').disabled = true;
+    document.getElementById('inX').disabled   = true;
+    document.getElementById('inY').disabled   = true;
+  } else {
+    overlay.classList.remove('visible');
+    if (carMode !== 'arrived') {
+      document.getElementById('btnGo').disabled = false;
+      document.getElementById('inX').disabled   = false;
+      document.getElementById('inY').disabled   = false;
+    }
+  }
+  // Vô hiệu nút obstacle nếu xe đang bận
+  const obsBtn = document.getElementById('btnObstacle');
+  if (carMode === 'turning' || carMode === 'moving') {
+    obsBtn.disabled = true;
+    obsBtn.style.opacity = '0.4';
+  } else {
+    obsBtn.disabled = false;
+    obsBtn.style.opacity = '1';
+  }
+  document.getElementById('compassDot').className     = 'dot ' + (compassOK ? 'ok' : 'error');
+  document.getElementById('compassLabel').textContent = compassOK ? 'COMPASS' : 'ENCODER';
+}
+function setWifiStatus(ok) {
+  document.getElementById('wifiDot').className     = 'dot ' + (ok ? 'ok pulse' : 'error');
+  document.getElementById('wifiLabel').textContent = ok ? ESP_IP : 'OFFLINE';
+}
+document.addEventListener('mouseup',  () => { if(holdTimer) releaseCmd(); });
+document.addEventListener('touchend', () => { if(holdTimer) releaseCmd(); });
+setInterval(pollData, 250);
+pollData();
+setInterval(() => { if(carMode!=='idle'||pendingTarget) drawMap(); }, 50);
+</script>
+</body>
+</html>
