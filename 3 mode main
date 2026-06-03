@@ -58,8 +58,8 @@ const int PWM_FREQ     = 1000;
 const int PWM_RES      = 8;
 const int PWM_CH_LEFT  = 0;
 const int PWM_CH_RIGHT = 1;
-int moveSpeed = 180;
-int turnSpeed = 180;
+int moveSpeed = 200;
+int turnSpeed = 250;
 
 // ─── VỊ TRÍ ─────────────────────────────────────────────────
 float posX  = 0.0f;
