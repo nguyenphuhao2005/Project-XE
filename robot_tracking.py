@@ -12,35 +12,48 @@ CAMERA_URL           = 'http://172.20.10.2:4747/video'
 CONFIDENCE_THRESHOLD = 0.4
 TARGET_CLASS_ID      = 0                 # 0 = person
 
-STOP_AREA_THRESHOLD  = 0.3              # Dừng nếu bbox > 50% frame (quá gần)
-SAFE_AREA_THRESHOLD  = 0.05             # Bbox < 5% → tiến chậm (quá xa)
+# ── 3 vùng khoảng cách (dựa trên diện tích bbox / frame) ────
+STOP_AREA_THRESHOLD  = 0.30# Dừng hẳn khi bbox > 22% frame
+SLOW_AREA_THRESHOLD  = 0.12  # Bắt đầu giảm tốc khi bbox > 12%
+SAFE_AREA_THRESHOLD  = 0.05  # Bbox < 5% → tiến chậm (quá xa)
 
-# ── PID (dùng chung cho cả ALIGN và FOLLOW) ──────────────────
-KP = 0.08
-KI = 0.001
-KD = 0.05
+# ── Tốc độ xoay theo 3 mức độ lệch ─────────────────────────
+ERR_SMALL = 75  # px: ngưỡng lệch nhỏ
+ERR_LARGE = 170 # px: ngưỡng lệch lớn
 
 # ── Tốc độ PWM (0–255) ───────────────────────────────────────
-SPEED_MIN      = 170    # Tốc độ tối thiểu để bánh còn quay
-SPEED_MAX      = 200   # Tốc độ tối đa tiến/lùi
-SPEED_FWD      = 180  # Tốc độ tiến mặc định khi đã căn giữa
-SPEED_ALIGN    = 180   # Tốc độ xoay tại chỗ khi đang căn giữa (nhỏ hơn → mượt hơn)
+SPEED_MIN      = 220
+SPEED_MAX      = 255
+SPEED_FWD      = 210
+SPEED_ALIGN    = 230
 
 # ── Ngưỡng căn giữa ──────────────────────────────────────────
-ALIGN_DEAD_ZONE   = 90   # px: sai lệch cho phép khi xoay căn giữa
-ALIGN_STABLE_TIME = 0.4  # giây: phải giữ giữa liên tục bao lâu mới chuyển sang FOLLOW
-FOLLOW_DEAD_ZONE  = 50   # px: dead zone khi đang FOLLOW (rộng hơn để không lắc)
+ALIGN_DEAD_ZONE    = 93 # sai lệch cho phép khi xoay căn giữa
+ALIGN_STABLE_TIME  = 0.2 # giây: phải giữ giữa liên tục bao lâu mới chuyển sang FOLLOW
+FOLLOW_DEAD_ZONE   = 120 #qd zone khi đang FOLLOW (rộng hơn để không lắc)
+
+# ── Tinh chỉnh khung hình sau khi FOLLOW xong ────────────────
+# Chỉnh 2 giá trị này nếu muốn căn chặt/lỏng hơn lúc đỗ
+FINETUNE_DEAD_ZONE  = 130#one rất hẹp để căn tâm chính xác nhất
+FINETUNE_STABLE_TIME = 0.3#iây: giữ tâm đủ lâu thì mới coi là xong
 
 # ── Timing ───────────────────────────────────────────────────
-SEND_INTERVAL  = 0.20   # giây (PHẢI < CMD_TIMEOUT_MS của ESP32 = 0.4s)
-CMD_HOLD_TIME  = 0.12   # giây: giữ lệnh tối thiểu trước khi đổi
-SMOOTH_WINDOW  = 5      # số frame lấy trung bình cx
-FRAME_SKIP     = 2      # xử lý YOLO mỗi N frame
+SEND_INTERVAL  = 0.20
+CMD_HOLD_TIME  = 0.12
+SMOOTH_WINDOW  = 5
+FRAME_SKIP     = 1
+YOLO_IMGSZ     = 320
 
 # ===================== KHỞI TẠO =====================
+import torch
 print("Loading YOLO model...")
 model = YOLO('yolov8n.pt')
-print("OK")
+
+if torch.cuda.is_available():
+    model.to('cuda')
+    print(f"OK — GPU: {torch.cuda.get_device_name(0)}")
+else:
+    print("OK — Không có GPU, chạy CPU (cài torch+cuda để nhanh hơn)")
 
 print("Connecting to camera...")
 cap = cv2.VideoCapture(CAMERA_URL)
@@ -51,18 +64,16 @@ if not cap.isOpened():
 print("OK — Press 'q' to quit.")
 
 # ── State machine ─────────────────────────────────────────────
-# ALIGN : xe xoay tại chỗ cho đến khi mục tiêu vào giữa
-# FOLLOW: mục tiêu đã căn giữa → tiến về phía mục tiêu + tiếp tục PID
-STATE_ALIGN  = "ALIGN"
-STATE_FOLLOW = "FOLLOW"
+# ALIGN   : xe xoay tại chỗ cho đến khi mục tiêu vào giữa
+# FOLLOW  : tiến về phía mục tiêu + giữ tâm
+# FINETUNE: đã đến đích, tinh chỉnh khung hình về tâm chính xác nhất
+STATE_ALIGN    = "ALIGN"
+STATE_FOLLOW   = "FOLLOW"
+STATE_FINETUNE = "FINETUNE"
 state = STATE_ALIGN
 
-align_stable_since = None   # thời điểm cx bắt đầu nằm trong ALIGN_DEAD_ZONE
-
-# ── PID ──────────────────────────────────────────────────────
-pid_integral  = 0.0
-pid_prev_err  = 0.0
-pid_last_time = time.time()
+align_stable_since    = None  # thời điểm cx bắt đầu nằm trong ALIGN_DEAD_ZONE
+finetune_stable_since = None  # thời điểm cx bắt đầu nằm trong FINETUNE_DEAD_ZONE
 
 # ── Moving average cx ────────────────────────────────────────
 cx_history = deque(maxlen=SMOOTH_WINDOW)
@@ -82,72 +93,103 @@ def clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
 
-def pid_update(error: float) -> float:
-    """Trả về u ∈ [-1, 1]. Dương = lệch phải."""
-    global pid_integral, pid_prev_err, pid_last_time
-    now = time.time()
-    dt  = max(now - pid_last_time, 1e-3)
-    pid_last_time = now
-
-    pid_integral += error * dt
-    pid_integral  = clamp(pid_integral, -300, 300)
-    derivative    = (error - pid_prev_err) / dt
-    pid_prev_err  = error
-
-    u = KP * error + KI * pid_integral + KD * derivative
-    return clamp(u / 100.0, -1.0, 1.0)
-
-
-def pid_reset():
-    global pid_integral, pid_prev_err, pid_last_time
-    pid_integral  = 0.0
-    pid_prev_err  = 0.0
-    pid_last_time = time.time()
+def spin_speed(abs_err: int) -> int:
+    """3 mức tốc độ xoay theo độ lệch."""
+    if abs_err < ERR_SMALL:
+        return SPEED_MIN
+    elif abs_err < ERR_LARGE:
+        return (SPEED_MIN + SPEED_ALIGN) // 2
+    else:
+        return SPEED_ALIGN
 
 
 def spin_command(err: int):
-    """
-    Xoay TẠI CHỖ (1 bánh tiến, 1 bánh lùi) để căn giữa.
-    Tốc độ tỉ lệ với |err| nhưng giới hạn ở SPEED_ALIGN.
-    Trả về (cmd, spd_l, spd_r).
-    """
-    ratio = clamp(abs(err) / 200.0, 0.3, 1.0)   # 0.3–1.0
-    spd   = int(SPEED_ALIGN * ratio)
-    spd   = clamp(spd, SPEED_MIN, SPEED_ALIGN)
-
-    if err > 0:   # mục tiêu lệch phải → xoay phải: trái tiến, phải lùi
-        return "right", spd, -spd
-    else:         # mục tiêu lệch trái → xoay trái: trái lùi, phải tiến
-        return "left", -spd, spd
+    """Xoay tại chỗ (4 bánh) để căn giữa."""
+    spd = spin_speed(abs(err))
+    if err > 0:
+        return "right", -spd, spd
+    else:
+        return "left", spd, -spd
 
 
 def follow_command(cx_smooth: int, frame_w: int, area_ratio: float):
     """
-    Differential drive khi đang FOLLOW.
-    Trả về (cmd, spd_l, spd_r).
+    Điều khiển khi FOLLOW:
+      STOP zone + chưa căn  → xoay tại chỗ (ALIGN_DEAD_ZONE)
+      STOP zone + đã căn    → "stop" → báo hiệu chuyển sang FINETUNE
+      SLOW zone             → tiến chậm dần
+      SAFE zone             → tiến tốc độ bình thường
     """
-    global pid_integral
+    err = cx_smooth - frame_w // 2
 
+    # ── STOP: quá gần ────────────────────────────────────────
     if area_ratio > STOP_AREA_THRESHOLD:
+        if abs(err) > ALIGN_DEAD_ZONE:
+            # Chưa vào tâm → xoay tại chỗ trước khi dừng
+            spd = spin_speed(abs(err))
+            if err > 0:
+                return "right", -spd, spd
+            else:
+                return "left", spd, -spd
+        # Đã vào tâm → dừng, báo hiệu để chuyển FINETUNE
         return "stop", 0, 0
 
-    if area_ratio < SAFE_AREA_THRESHOLD:
-        return "forward", SPEED_MIN, SPEED_MIN
+    # ── Tính base speed theo vùng khoảng cách ────────────────
+    if area_ratio > SLOW_AREA_THRESHOLD:
+        t    = (area_ratio - SLOW_AREA_THRESHOLD) / (STOP_AREA_THRESHOLD - SLOW_AREA_THRESHOLD)
+        base = int(SPEED_FWD + t * (SPEED_MIN - SPEED_FWD))
+        base = clamp(base, SPEED_MIN, SPEED_FWD)
+    elif area_ratio < SAFE_AREA_THRESHOLD:
+        base = SPEED_MIN
+    else:
+        base = SPEED_FWD
+
+    # ── Trong dead zone: tiến thẳng ──────────────────────────
+    if abs(err) <= FOLLOW_DEAD_ZONE:
+        return "forward", base, base
+
+    # ── Ngoài dead zone: xoay tại chỗ ───────────────────────
+    spd = spin_speed(abs(err))
+    if err > 0:
+        return "right", -spd, spd
+    else:
+        return "left", spd, -spd
+
+
+def fine_tune_command(cx_smooth: int, frame_w: int, now: float) -> tuple:
+    """
+    Tinh chỉnh khung hình SAU KHI đã FOLLOW xong.
+    Chỉ kích hoạt ở STATE_FINETUNE — không can thiệp vào ALIGN/FOLLOW.
+
+    Logic:
+      - Dùng FINETUNE_DEAD_ZONE (rất hẹp, mặc định 20px) để căn chính xác.
+      - Luôn dùng SPEED_MIN (tốc độ thấp nhất) để xoay tinh tế.
+      - Phải giữ tâm liên tục FINETUNE_STABLE_TIME giây mới coi là xong.
+      - Trả về (cmd, spd_l, spd_r, done):
+            done=True  → đã căn xong, có thể dừng hẳn
+            done=False → vẫn đang tinh chỉnh
+    """
+    global finetune_stable_since
 
     err = cx_smooth - frame_w // 2
 
-    if abs(err) <= FOLLOW_DEAD_ZONE:
-        pid_integral = 0
-        return "forward", SPEED_FWD, SPEED_FWD
-
-    u     = pid_update(err)
-    delta = int(abs(u) * (SPEED_MAX - SPEED_MIN))
-    base  = SPEED_FWD
-
-    if u > 0:   # lệch phải
-        return "right", clamp(base + delta, SPEED_MIN, SPEED_MAX), clamp(base - delta, SPEED_MIN, SPEED_MAX)
-    else:       # lệch trái
-        return "left",  clamp(base - delta, SPEED_MIN, SPEED_MAX), clamp(base + delta, SPEED_MIN, SPEED_MAX)
+    if abs(err) <= FINETUNE_DEAD_ZONE:
+        # Trong tâm → đếm thời gian giữ ổn định
+        if finetune_stable_since is None:
+            finetune_stable_since = now
+        elif now - finetune_stable_since >= FINETUNE_STABLE_TIME:
+            # Giữ đủ lâu → xong hoàn toàn
+            finetune_stable_since = None
+            return "stop", 0, 0, True   # done=True
+        # Chưa đủ thời gian giữ → dừng chờ
+        return "stop", 0, 0, False
+    else:
+        # Ngoài tâm → reset bộ đếm và xoay tinh chỉnh
+        finetune_stable_since = None
+        if err > 0:
+            return "right", -SPEED_MIN, SPEED_MIN, False
+        else:
+            return "left", SPEED_MIN, -SPEED_MIN, False
 
 
 def send_track(cmd: str, spd_l: int, spd_r: int):
@@ -173,7 +215,7 @@ while True:
             break
         continue
 
-    results   = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
+    results   = model(frame, conf=CONFIDENCE_THRESHOLD, imgsz=YOLO_IMGSZ, verbose=False)
     annotated = results[0].plot()
     boxes     = results[0].boxes
 
@@ -204,33 +246,44 @@ while True:
             # ════════════════════════════════════════════
             if state == STATE_ALIGN:
                 if abs(err) <= ALIGN_DEAD_ZONE:
-                    # Bắt đầu đếm thời gian giữ giữa
                     if align_stable_since is None:
                         align_stable_since = now
                     elif now - align_stable_since >= ALIGN_STABLE_TIME:
-                        # Đã giữ giữa đủ lâu → chuyển sang FOLLOW
                         state = STATE_FOLLOW
                         align_stable_since = None
-                        pid_reset()
                         print("[STATE] ALIGN → FOLLOW")
-                    # Vẫn đang trong dead zone, chờ thêm → dừng tại chỗ
                     cmd, spd_l, spd_r = "stop", 0, 0
                 else:
-                    # Chưa vào giữa → xoay tại chỗ
                     align_stable_since = None
                     cmd, spd_l, spd_r  = spin_command(err)
 
-            else:  # STATE_FOLLOW
+            elif state == STATE_FOLLOW:
                 if abs(err) > FOLLOW_DEAD_ZONE * 3:
-                    # Lệch quá nhiều (mục tiêu di chuyển ngang mạnh)
-                    # Quay về ALIGN để căn lại trước
+                    # Lệch quá nhiều → căn lại từ đầu
                     state = STATE_ALIGN
-                    align_stable_since = None
-                    pid_reset()
+                    align_stable_since    = None
+                    finetune_stable_since = None
                     cmd, spd_l, spd_r = spin_command(err)
                     print("[STATE] FOLLOW → ALIGN (lệch quá)")
                 else:
                     cmd, spd_l, spd_r = follow_command(cx_smooth, frame.shape[1], area_ratio)
+                    # ★ follow_command trả "stop" khi đã vào STOP zone + căn đủ
+                    #   → chuyển sang FINETUNE để tinh chỉnh lần cuối
+                    if cmd == "stop" and area_ratio > STOP_AREA_THRESHOLD:
+                        state = STATE_FINETUNE
+                        finetune_stable_since = None
+                        print("[STATE] FOLLOW → FINETUNE")
+
+            elif state == STATE_FINETUNE:
+                # ★ Gọi hàm tinh chỉnh riêng — chỉ kích hoạt ở đây
+                cmd, spd_l, spd_r, done = fine_tune_command(cx_smooth, frame.shape[1], now)
+                if done:
+                    print("[STATE] FINETUNE → DONE (đã căn tâm chính xác)")
+                # Nếu mục tiêu bỗng đi ra xa (người lùi lại) → quay lại FOLLOW
+                if area_ratio < SLOW_AREA_THRESHOLD:
+                    state = STATE_FOLLOW
+                    finetune_stable_since = None
+                    print("[STATE] FINETUNE → FOLLOW (mục tiêu lùi xa)")
 
             # ── Debug overlay ────────────────────────────
             cv2.circle(annotated, (cx_smooth, (y1 + y2) // 2), 6, (0, 255, 255), -1)
@@ -238,22 +291,21 @@ while True:
                         f"err={err:+d}  area={area_ratio:.2f}  [{state}]",
                         (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
-            # Vẽ vùng dead zone căn giữa
+            # Vẽ vùng dead zone (đổi màu theo state)
             fc = frame.shape[1] // 2
-            cv2.line(annotated, (fc - ALIGN_DEAD_ZONE, 0),
-                     (fc - ALIGN_DEAD_ZONE, frame.shape[0]), (0, 200, 255), 1)
-            cv2.line(annotated, (fc + ALIGN_DEAD_ZONE, 0),
-                     (fc + ALIGN_DEAD_ZONE, frame.shape[0]), (0, 200, 255), 1)
+            dz_color = (0, 80, 255) if state == STATE_FINETUNE else (0, 200, 255)
+            dz = FINETUNE_DEAD_ZONE if state == STATE_FINETUNE else ALIGN_DEAD_ZONE
+            cv2.line(annotated, (fc - dz, 0), (fc - dz, frame.shape[0]), dz_color, 1)
+            cv2.line(annotated, (fc + dz, 0), (fc + dz, frame.shape[0]), dz_color, 1)
             break
 
     if not target_found:
-        # Mất mục tiêu → dừng và quay về ALIGN để chờ
         cmd, spd_l, spd_r = "stop", 0, 0
-        if state == STATE_FOLLOW:
+        if state in (STATE_FOLLOW, STATE_FINETUNE):
             state = STATE_ALIGN
-            align_stable_since = None
-            pid_reset()
-            print("[STATE] FOLLOW → ALIGN (mất mục tiêu)")
+            align_stable_since    = None
+            finetune_stable_since = None
+            print(f"[STATE] {state} → ALIGN (mất mục tiêu)")
 
     # ── Giữ lệnh CMD_HOLD_TIME trước khi đổi ────────────────
     now = time.time()
@@ -269,23 +321,49 @@ while True:
         send_track(confirmed_cmd, spd_l, spd_r)
         last_cmd  = confirmed_cmd
         last_send = now
-        print(f"[{state:6}] {confirmed_cmd:8s}  L={spd_l:+4d}  R={spd_r:+4d}")
+        print(f"[{state:8}] {confirmed_cmd:8s}  L={spd_l:+4d}  R={spd_r:+4d}")
 
     # ── HUD ─────────────────────────────────────────────────
-    color_hud = (0, 255, 0) if state == STATE_FOLLOW else (0, 165, 255)
+    hud_colors = {
+        STATE_ALIGN:    (0, 165, 255),   # cam
+        STATE_FOLLOW:   (0, 255, 0),     # xanh lá
+        STATE_FINETUNE: (0, 80, 255),    # xanh dương
+    }
+    color_hud = hud_colors.get(state, (255, 255, 255))
     cv2.putText(annotated,
                 f"[{state}] {confirmed_cmd}  L={spd_l} R={spd_r}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_hud, 2)
 
-    # Thanh progress căn giữa (chỉ hiện khi ALIGN)
-    if state == STATE_ALIGN and target_found:
-        fc   = frame.shape[1] // 2
-        pct  = clamp(1.0 - abs(err) / (frame.shape[1] / 2), 0, 1)
+    # ── Thanh khoảng cách ────────────────────────────────────
+    if target_found:
+        bar_x, bar_y, bar_h, bar_total = 10, 45, 14, 220
+        cv2.rectangle(annotated, (bar_x, bar_y), (bar_x + bar_total, bar_y + bar_h), (40, 40, 40), -1)
+        filled = int(clamp(area_ratio / STOP_AREA_THRESHOLD, 0, 1) * bar_total)
+        if area_ratio > STOP_AREA_THRESHOLD:
+            bar_color = (0, 0, 220)
+        elif area_ratio > SLOW_AREA_THRESHOLD:
+            bar_color = (0, 200, 255)
+        else:
+            bar_color = (0, 210, 60)
+        cv2.rectangle(annotated, (bar_x, bar_y), (bar_x + filled, bar_y + bar_h), bar_color, -1)
+        slow_x = int(SLOW_AREA_THRESHOLD / STOP_AREA_THRESHOLD * bar_total) + bar_x
+        cv2.line(annotated, (slow_x, bar_y), (slow_x, bar_y + bar_h), (0, 200, 255), 2)
+        cv2.putText(annotated, f"area={area_ratio:.2f}", (bar_x + bar_total + 5, bar_y + 11),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, bar_color, 1)
+
+    # ── Thanh progress căn giữa (ALIGN / FINETUNE) ───────────
+    show_align_bar = (state == STATE_ALIGN and target_found)
+    show_ft_bar    = (state == STATE_FINETUNE and target_found)
+    if show_align_bar or show_ft_bar:
+        dz    = FINETUNE_DEAD_ZONE if show_ft_bar else ALIGN_DEAD_ZONE
+        label = "FineTune" if show_ft_bar else "Align"
+        color = (0, 80, 255) if show_ft_bar else (0, 165, 255)
+        pct   = clamp(1.0 - abs(err) / (frame.shape[1] / 2), 0, 1)
         bar_w = int(200 * pct)
-        cv2.rectangle(annotated, (10, 45), (210, 62), (50, 50, 50), -1)
-        cv2.rectangle(annotated, (10, 45), (10 + bar_w, 62), (0, 165, 255), -1)
-        cv2.putText(annotated, "Align", (215, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        cv2.rectangle(annotated, (10, 65), (210, 80), (50, 50, 50), -1)
+        cv2.rectangle(annotated, (10, 65), (10 + bar_w, 80), color, -1)
+        cv2.putText(annotated, label, (215, 78),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
     cv2.imshow("Person Tracking", annotated)
 
